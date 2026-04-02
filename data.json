@@ -1,0 +1,15 @@
+{
+  "players": [
+    {
+      "discordId": "1239726277196386404",
+      "name": "pochita",
+      "points": 100,
+      "matchesPlayed": 0,
+      "wins": 0,
+      "top4": 0
+    }
+  ],
+  "queue": [],
+  "matches": [],
+  "nextMatchId": 1
+}
