@@ -1,5 +1,4 @@
 require('dotenv').config();
-require('./web');
 
 const {
   Client,
@@ -12,13 +11,8 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const FormData = require('form-data');
-
-let mongoose = null;
-try {
-  mongoose = require('mongoose');
-} catch (err) {
-  console.warn('mongoose chưa được cài, bot sẽ chạy bằng file data.json');
-}
+const mongoose = require('mongoose');
+const { startWeb } = require('./web');
 
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 
@@ -57,34 +51,40 @@ function saveFileData(snapshot) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(normalizeData(snapshot), null, 2), 'utf8');
 }
 
-let DataModel = null;
+const dataSchema = new mongoose.Schema(
+  {
+    players: { type: Array, default: [] },
+    queue: { type: Array, default: [] },
+    matches: { type: Array, default: [] },
+    nextMatchId: { type: Number, default: 1 },
+  },
+  {
+    collection: 'datas',
+    versionKey: false,
+    strict: false,
+  }
+);
+
+const Data = mongoose.models.Data || mongoose.model('Data', dataSchema);
+
+let data = defaultData();
 let mongoReady = false;
-let data = loadFileData();
 
 async function initMongo() {
-  if (!mongoose || !process.env.MONGO_URI) {
-    return;
+  if (!process.env.MONGO_URI) {
+    throw new Error('Thiếu MONGO_URI trong file .env / Render Environment');
   }
 
+  if (mongoose.connection.readyState === 1) {
+    mongoReady = true;
+    console.log('MongoDB connected');
+    return;
+  }
+  console.log('MONGO_URI prefix:', String(process.env.MONGO_URI || '').slice(0, 20));
   await mongoose.connect(process.env.MONGO_URI, {
     serverSelectionTimeoutMS: 15000,
   });
 
-  const dataSchema = new mongoose.Schema(
-    {
-      players: { type: Array, default: [] },
-      queue: { type: Array, default: [] },
-      matches: { type: Array, default: [] },
-      nextMatchId: { type: Number, default: 1 },
-    },
-    {
-      collection: 'datas',
-      versionKey: false,
-      strict: false,
-    }
-  );
-
-  DataModel = mongoose.models.Data || mongoose.model('Data', dataSchema);
   mongoReady = true;
   console.log('MongoDB connected');
 }
@@ -93,17 +93,18 @@ async function loadData() {
   const fileData = loadFileData();
   data = fileData;
 
-  if (!mongoReady || !DataModel) {
+  if (!mongoReady) {
     saveFileData(data);
     return;
   }
 
-  const db = await DataModel.findOne().lean();
+  const db = await Data.findOne().lean();
 
   if (!db) {
-    await DataModel.create(fileData);
+    await Data.create(fileData);
     data = fileData;
     saveFileData(data);
+    console.log('Created new DB from local backup');
     return;
   }
 
@@ -123,32 +124,32 @@ async function loadData() {
 
   if (mongoEmpty && fileHasData) {
     data = fileData;
-    await DataModel.findOneAndUpdate({}, data, {
-      upsert: true,
-      new: true,
-      setDefaultsOnInsert: true,
-    });
+    await Data.findOneAndUpdate(
+      {},
+      { $set: data },
+      { upsert: true }
+    );
     saveFileData(data);
+    console.log('Restored MongoDB from data.json backup');
     return;
   }
 
   data = mongoData;
   saveFileData(data);
+  console.log('Loaded DB from MongoDB');
 }
 
 async function saveData() {
   data = normalizeData(data);
   saveFileData(data);
 
-  if (!mongoReady || !DataModel) {
-    return;
-  }
+  if (!mongoReady) return;
 
-  await DataModel.findOneAndUpdate({}, data, {
-    upsert: true,
-    new: true,
-    setDefaultsOnInsert: true,
-  });
+  await Data.findOneAndUpdate(
+    {},
+    { $set: data },
+    { upsert: true }
+  );
 }
 
 function getPlayerByDiscordId(discordId) {
@@ -209,7 +210,7 @@ function getRankedPlayers() {
         points: Number(player.points || 0),
         matchesPlayed: Number(player.matchesPlayed || 0),
         wins: Number(player.wins || 0),
-        top4: Number(player.top4 || 0),
+        top4Count: Number(player.top4Count || 0),
       };
     })
     .sort((a, b) => {
@@ -328,7 +329,7 @@ async function applyResults(matchId, placements) {
     return { ok: false, message: 'Tên trong kết quả đang bị trùng.' };
   }
 
-  const matchNames = match.players.map((p) => String(p.name).toLowerCase());
+  const matchNames = (match.players || []).map((p) => String(p.name).toLowerCase());
   for (const name of normalized) {
     if (!matchNames.includes(name)) {
       return { ok: false, message: `Tên "${name}" không nằm trong match #${matchId}.` };
@@ -340,7 +341,7 @@ async function applyResults(matchId, placements) {
     const playerName = placements[i].trim();
     const delta = POINTS_BY_PLACEMENT[placement];
 
-    const matchPlayer = match.players.find(
+    const matchPlayer = (match.players || []).find(
       (p) => String(p.name).toLowerCase() === playerName.toLowerCase()
     );
     const player = getPlayerByName(playerName);
@@ -355,7 +356,7 @@ async function applyResults(matchId, placements) {
     player.points = Number(player.points || 0) + delta;
     player.matchesPlayed = Number(player.matchesPlayed || 0) + 1;
     player.wins = Number(player.wins || 0) + (placement === 1 ? 1 : 0);
-    player.top4 = Number(player.top4 || 0) + (placement <= 4 ? 1 : 0);
+    player.top4Count = Number(player.top4Count || 0) + (placement <= 4 ? 1 : 0);
   }
 
   match.status = 'COMPLETED';
@@ -368,7 +369,7 @@ async function applyResults(matchId, placements) {
 async function extractTextFromImageUrl(imageUrl) {
   const apiKey = process.env.OCR_KEY || process.env.OCR_SPACE_API_KEY;
   if (!apiKey) {
-    throw new Error('Thiếu OCR_KEY trong file .env');
+    throw new Error('Thiếu OCR_KEY trong file .env / Render Environment');
   }
 
   const imageResponse = await axios.get(imageUrl, {
@@ -399,7 +400,7 @@ function detectPlacementsFromOcrText(match, ocrText) {
   const normalized = String(ocrText || '').toLowerCase();
 
   const found = [];
-  for (const player of match.players) {
+  for (const player of match.players || []) {
     const idx = normalized.indexOf(String(player.name).toLowerCase());
     if (idx !== -1) {
       found.push({
@@ -558,7 +559,7 @@ client.on('interactionCreate', async (interaction) => {
         points: 100,
         matchesPlayed: 0,
         wins: 0,
-        top4: 0,
+        top4Count: 0,
       });
 
       await saveData();
@@ -588,7 +589,7 @@ client.on('interactionCreate', async (interaction) => {
       const inOpenMatch = data.matches.some(
         (m) =>
           m.status === 'OPEN' &&
-          m.players.some((p) => p.discordId === interaction.user.id)
+          (m.players || []).some((p) => p.discordId === interaction.user.id)
       );
 
       if (inOpenMatch) {
@@ -604,7 +605,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const match = await createMatchIfEnoughPlayers();
 
-      if (match && match.players.some((p) => p.discordId === interaction.user.id)) {
+      if (match && (match.players || []).some((p) => p.discordId === interaction.user.id)) {
         await interaction.reply(
           `**${player.name}** đã vào queue.\nĐủ 8 người, đã tạo **match #${match.id}**.\nDùng \`/current_match\` để xem danh sách.`
         );
@@ -693,7 +694,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const blocks = completed.map((match) => {
-        const sorted = [...match.players].sort((a, b) => a.placement - b.placement);
+        const sorted = [...(match.players || [])].sort((a, b) => a.placement - b.placement);
         const lines = sorted.map((p) => {
           const sign = p.pointsChange > 0 ? '+' : '';
           return `${p.placement}. ${p.name} (${sign}${p.pointsChange})`;
@@ -796,9 +797,11 @@ client.on('interactionCreate', async (interaction) => {
   try {
     await initMongo();
   } catch (error) {
-    console.error('MongoDB connect failed, fallback sang data.json:', error.message);
+    console.error('MongoDB connect failed:', error.message);
+    process.exit(1);
   }
 
   await loadData();
+  await startWeb();
   client.login(process.env.DISCORD_TOKEN);
 })();
