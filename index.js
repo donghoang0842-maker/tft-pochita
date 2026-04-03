@@ -7,10 +7,18 @@ const {
   REST,
   Routes,
 } = require('discord.js');
+
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const FormData = require('form-data');
+
+let mongoose = null;
+try {
+  mongoose = require('mongoose');
+} catch (err) {
+  console.warn('mongoose chưa được cài, bot sẽ chạy bằng file data.json');
+}
 
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
 
@@ -23,30 +31,124 @@ function defaultData() {
   };
 }
 
-function loadData() {
+function normalizeData(raw) {
+  return {
+    players: Array.isArray(raw?.players) ? raw.players : [],
+    queue: Array.isArray(raw?.queue) ? raw.queue : [],
+    matches: Array.isArray(raw?.matches) ? raw.matches : [],
+    nextMatchId: Number.isInteger(raw?.nextMatchId) ? raw.nextMatchId : 1,
+  };
+}
+
+function loadFileData() {
   if (!fs.existsSync(DATA_FILE)) {
     return defaultData();
   }
 
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-
-    return {
-      players: Array.isArray(parsed.players) ? parsed.players : [],
-      queue: Array.isArray(parsed.queue) ? parsed.queue : [],
-      matches: Array.isArray(parsed.matches) ? parsed.matches : [],
-      nextMatchId: Number.isInteger(parsed.nextMatchId) ? parsed.nextMatchId : 1,
-    };
+    return normalizeData(JSON.parse(raw));
   } catch {
     return defaultData();
   }
 }
 
-let data = loadData();
+function saveFileData(snapshot) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(normalizeData(snapshot), null, 2), 'utf8');
+}
 
-function saveData() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8');
+let DataModel = null;
+let mongoReady = false;
+let data = loadFileData();
+
+async function initMongo() {
+  if (!mongoose || !process.env.MONGO_URI) {
+    return;
+  }
+
+  await mongoose.connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 15000,
+  });
+
+  const dataSchema = new mongoose.Schema(
+    {
+      players: { type: Array, default: [] },
+      queue: { type: Array, default: [] },
+      matches: { type: Array, default: [] },
+      nextMatchId: { type: Number, default: 1 },
+    },
+    {
+      collection: 'datas',
+      versionKey: false,
+      strict: false,
+    }
+  );
+
+  DataModel = mongoose.models.Data || mongoose.model('Data', dataSchema);
+  mongoReady = true;
+  console.log('MongoDB connected');
+}
+
+async function loadData() {
+  const fileData = loadFileData();
+  data = fileData;
+
+  if (!mongoReady || !DataModel) {
+    saveFileData(data);
+    return;
+  }
+
+  const db = await DataModel.findOne().lean();
+
+  if (!db) {
+    await DataModel.create(fileData);
+    data = fileData;
+    saveFileData(data);
+    return;
+  }
+
+  const mongoData = normalizeData(db);
+
+  const mongoEmpty =
+    mongoData.players.length === 0 &&
+    mongoData.queue.length === 0 &&
+    mongoData.matches.length === 0 &&
+    mongoData.nextMatchId === 1;
+
+  const fileHasData =
+    fileData.players.length > 0 ||
+    fileData.queue.length > 0 ||
+    fileData.matches.length > 0 ||
+    fileData.nextMatchId !== 1;
+
+  if (mongoEmpty && fileHasData) {
+    data = fileData;
+    await DataModel.findOneAndUpdate({}, data, {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    });
+    saveFileData(data);
+    return;
+  }
+
+  data = mongoData;
+  saveFileData(data);
+}
+
+async function saveData() {
+  data = normalizeData(data);
+  saveFileData(data);
+
+  if (!mongoReady || !DataModel) {
+    return;
+  }
+
+  await DataModel.findOneAndUpdate({}, data, {
+    upsert: true,
+    new: true,
+    setDefaultsOnInsert: true,
+  });
 }
 
 function getPlayerByDiscordId(discordId) {
@@ -131,7 +233,7 @@ function getQueuePlayers() {
     .filter(Boolean);
 }
 
-function createMatchIfEnoughPlayers() {
+async function createMatchIfEnoughPlayers() {
   if (data.queue.length < 8) return null;
 
   const existingOpenMatch = getOpenMatch();
@@ -161,7 +263,7 @@ function createMatchIfEnoughPlayers() {
   };
 
   data.matches.push(match);
-  saveData();
+  await saveData();
   return match;
 }
 
@@ -203,7 +305,7 @@ const POINTS_BY_PLACEMENT = {
   8: -8,
 };
 
-function applyResults(matchId, placements) {
+async function applyResults(matchId, placements) {
   const match = data.matches.find((m) => m.id === matchId);
   if (!match) {
     return { ok: false, message: 'Không tìm thấy match.' };
@@ -258,7 +360,7 @@ function applyResults(matchId, placements) {
 
   match.status = 'COMPLETED';
   match.reportedAt = new Date().toISOString();
-  saveData();
+  await saveData();
 
   return { ok: true, message: `Đã chấm điểm cho match #${matchId}.` };
 }
@@ -459,7 +561,7 @@ client.on('interactionCreate', async (interaction) => {
         top4: 0,
       });
 
-      saveData();
+      await saveData();
       await interaction.reply(`Đăng ký thành công: **${name}** | Điểm khởi đầu: **100**`);
       return;
     }
@@ -498,9 +600,9 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       data.queue.push(interaction.user.id);
-      saveData();
+      await saveData();
 
-      const match = createMatchIfEnoughPlayers();
+      const match = await createMatchIfEnoughPlayers();
 
       if (match && match.players.some((p) => p.discordId === interaction.user.id)) {
         await interaction.reply(
@@ -527,7 +629,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       data.queue.splice(index, 1);
-      saveData();
+      await saveData();
 
       await interaction.reply('Bạn đã rời queue.');
       return;
@@ -621,7 +723,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       match.resultImageUrl = image.url;
-      saveData();
+      await saveData();
 
       await interaction.deferReply();
 
@@ -629,7 +731,7 @@ client.on('interactionCreate', async (interaction) => {
       try {
         ocrText = await extractTextFromImageUrl(image.url);
         match.ocrText = ocrText;
-        saveData();
+        await saveData();
       } catch (error) {
         await interaction.editReply(
           `Đã lưu ảnh cho **match #${matchId}** nhưng OCR lỗi.\nLỗi: ${error.message}`
@@ -646,7 +748,7 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const result = applyResults(matchId, detected.placements);
+      const result = await applyResults(matchId, detected.placements);
 
       if (!result.ok) {
         await interaction.editReply(
@@ -668,7 +770,7 @@ client.on('interactionCreate', async (interaction) => {
         interaction.options.getString(`top${n}`, true).trim()
       );
 
-      const result = applyResults(matchId, placements);
+      const result = await applyResults(matchId, placements);
 
       if (!result.ok) {
         await interaction.reply({ content: result.message, ephemeral: true });
@@ -690,4 +792,13 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+(async () => {
+  try {
+    await initMongo();
+  } catch (error) {
+    console.error('MongoDB connect failed, fallback sang data.json:', error.message);
+  }
+
+  await loadData();
+  client.login(process.env.DISCORD_TOKEN);
+})();
