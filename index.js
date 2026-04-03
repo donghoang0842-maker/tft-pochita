@@ -5,6 +5,7 @@ const {
   GatewayIntentBits,
   REST,
   Routes,
+  PermissionsBitField,
 } = require('discord.js');
 
 const fs = require('fs');
@@ -15,6 +16,7 @@ const mongoose = require('mongoose');
 const { startWeb } = require('./web');
 
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+const QUEUE_EXPIRE_MS = 30 * 60 * 1000;
 
 function defaultData() {
   return {
@@ -22,6 +24,7 @@ function defaultData() {
     queue: [],
     matches: [],
     nextMatchId: 1,
+    queueStartedAt: null,
   };
 }
 
@@ -31,6 +34,10 @@ function normalizeData(raw) {
     queue: Array.isArray(raw?.queue) ? raw.queue : [],
     matches: Array.isArray(raw?.matches) ? raw.matches : [],
     nextMatchId: Number.isInteger(raw?.nextMatchId) ? raw.nextMatchId : 1,
+    queueStartedAt:
+      typeof raw?.queueStartedAt === 'string' || raw?.queueStartedAt === null
+        ? raw.queueStartedAt
+        : null,
   };
 }
 
@@ -57,6 +64,7 @@ const dataSchema = new mongoose.Schema(
     queue: { type: Array, default: [] },
     matches: { type: Array, default: [] },
     nextMatchId: { type: Number, default: 1 },
+    queueStartedAt: { type: String, default: null },
   },
   {
     collection: 'datas',
@@ -166,6 +174,10 @@ function getOpenMatch() {
   return data.matches.find((m) => m.status === 'OPEN') || null;
 }
 
+function getOpenMatches() {
+  return data.matches.filter((m) => m.status === 'OPEN');
+}
+
 function createPlacementCounter() {
   return {
     top1: 0,
@@ -234,38 +246,75 @@ function getQueuePlayers() {
     .filter(Boolean);
 }
 
-async function createMatchIfEnoughPlayers() {
-  if (data.queue.length < 8) return null;
+function resetQueueTimerIfNeeded() {
+  if (data.queue.length === 0) {
+    data.queueStartedAt = null;
+    return;
+  }
 
-  const existingOpenMatch = getOpenMatch();
-  if (existingOpenMatch) return existingOpenMatch;
+  if (!data.queueStartedAt) {
+    data.queueStartedAt = new Date().toISOString();
+  }
+}
 
-  const selectedIds = data.queue.slice(0, 8);
-  data.queue = data.queue.slice(8);
+async function clearExpiredQueueIfNeeded() {
+  if (!data.queue.length) return false;
+  if (!data.queueStartedAt) return false;
+  if (data.queue.length >= 8) return false;
 
-  const players = selectedIds
-    .map((discordId) => getPlayerByDiscordId(discordId))
-    .filter(Boolean)
-    .map((player) => ({
-      discordId: player.discordId,
-      name: player.name,
-      placement: null,
-      pointsChange: 0,
-    }));
+  const startedAt = new Date(data.queueStartedAt).getTime();
+  if (!Number.isFinite(startedAt)) {
+    data.queueStartedAt = new Date().toISOString();
+    await saveData();
+    return false;
+  }
 
-  const match = {
-    id: data.nextMatchId++,
-    status: 'OPEN',
-    createdAt: new Date().toISOString(),
-    reportedAt: null,
-    resultImageUrl: null,
-    ocrText: null,
-    players,
-  };
+  const expired = Date.now() - startedAt >= QUEUE_EXPIRE_MS;
+  if (!expired) return false;
 
-  data.matches.push(match);
+  data.queue = [];
+  data.queueStartedAt = null;
   await saveData();
-  return match;
+  console.log('Queue expired after 30 minutes and was cleared automatically');
+  return true;
+}
+
+async function createMatchIfEnoughPlayers() {
+  if (data.queue.length < 8) return [];
+
+  const createdMatches = [];
+
+  while (data.queue.length >= 8) {
+    const selectedIds = data.queue.slice(0, 8);
+    data.queue = data.queue.slice(8);
+
+    const players = selectedIds
+      .map((discordId) => getPlayerByDiscordId(discordId))
+      .filter(Boolean)
+      .map((player) => ({
+        discordId: player.discordId,
+        name: player.name,
+        placement: null,
+        pointsChange: 0,
+      }));
+
+    const match = {
+      id: data.nextMatchId++,
+      status: 'OPEN',
+      createdAt: new Date().toISOString(),
+      reportedAt: null,
+      resultImageUrl: null,
+      ocrText: null,
+      players,
+    };
+
+    data.matches.push(match);
+    createdMatches.push(match);
+  }
+
+  resetQueueTimerIfNeeded();
+  await saveData();
+  return createdMatches;
 }
 
 function formatMatch(match) {
@@ -458,6 +507,24 @@ client.once('clientReady', async () => {
       ],
     },
     {
+      name: 'register_user',
+      description: 'Admin đăng ký hộ người chơi',
+      options: [
+        {
+          name: 'user',
+          description: 'Discord user cần đăng ký',
+          type: 6,
+          required: true,
+        },
+        {
+          name: 'name',
+          description: 'Ingame name',
+          type: 3,
+          required: true,
+        },
+      ],
+    },
+    {
       name: 'join',
       description: 'Join queue',
     },
@@ -567,6 +634,50 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'register_user') {
+      if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
+        await interaction.reply({
+          content: 'Chỉ admin mới dùng được lệnh này.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const targetUser = interaction.options.getUser('user', true);
+      const name = interaction.options.getString('name', true).trim();
+
+      if (getPlayerByDiscordId(targetUser.id)) {
+        await interaction.reply({
+          content: 'Người này đã đăng ký rồi.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (getPlayerByName(name)) {
+        await interaction.reply({
+          content: 'Tên này đã được dùng.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      data.players.push({
+        discordId: targetUser.id,
+        name,
+        points: 100,
+        matchesPlayed: 0,
+        wins: 0,
+        top4Count: 0,
+      });
+
+      await saveData();
+      await interaction.reply(
+        `Đăng ký hộ thành công: <@${targetUser.id}> -> **${name}** | Điểm khởi đầu: **100**`
+      );
+      return;
+    }
+
     if (interaction.commandName === 'join') {
       const player = getPlayerByDiscordId(interaction.user.id);
 
@@ -601,13 +712,22 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       data.queue.push(interaction.user.id);
+      resetQueueTimerIfNeeded();
       await saveData();
 
-      const match = await createMatchIfEnoughPlayers();
+      const createdMatches = await createMatchIfEnoughPlayers();
+      const myMatch = createdMatches.find((match) =>
+        (match.players || []).some((p) => p.discordId === interaction.user.id)
+      );
 
-      if (match && (match.players || []).some((p) => p.discordId === interaction.user.id)) {
+      if (myMatch) {
+        const extraInfo =
+          createdMatches.length > 1
+            ? `\nĐã tự tạo tổng cộng **${createdMatches.length}** match mới từ queue.`
+            : '';
+
         await interaction.reply(
-          `**${player.name}** đã vào queue.\nĐủ 8 người, đã tạo **match #${match.id}**.\nDùng \`/current_match\` để xem danh sách.`
+          `**${player.name}** đã vào queue.\nĐủ 8 người, đã tạo **match #${myMatch.id}**.${extraInfo}\nDùng \`/current_match\` để xem danh sách.`
         );
         return;
       }
@@ -630,6 +750,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       data.queue.splice(index, 1);
+      resetQueueTimerIfNeeded();
       await saveData();
 
       await interaction.reply('Bạn đã rời queue.');
@@ -645,21 +766,33 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const lines = players.map((player, index) => `${index + 1}. ${player.name}`);
+
+      let timerLine = '';
+      if (data.queueStartedAt && data.queue.length < 8) {
+        const remainingMs = Math.max(
+          0,
+          QUEUE_EXPIRE_MS - (Date.now() - new Date(data.queueStartedAt).getTime())
+        );
+        const remainingMinutes = Math.ceil(remainingMs / 60000);
+        timerLine = `\nQueue sẽ tự hủy sau khoảng **${remainingMinutes}** phút nữa nếu chưa đủ 8 người.`;
+      }
+
       await interaction.reply(
-        `Hiện có **${players.length}** người trong queue:\n${lines.join('\n')}`
+        `Hiện có **${players.length}** người trong queue:\n${lines.join('\n')}${timerLine}`
       );
       return;
     }
 
     if (interaction.commandName === 'current_match') {
-      const openMatch = getOpenMatch();
+      const openMatches = getOpenMatches();
 
-      if (!openMatch) {
+      if (!openMatches.length) {
         await interaction.reply('Hiện không có match nào đang mở.');
         return;
       }
 
-      await interaction.reply(`\`\`\`\n${formatMatch(openMatch)}\n\`\`\``);
+      const blocks = openMatches.map((match) => formatMatch(match));
+      await interaction.reply(`\`\`\`\n${blocks.join('\n\n')}\n\`\`\``);
       return;
     }
 
@@ -792,6 +925,15 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 });
+
+setInterval(async () => {
+  try {
+    if (!mongoReady) return;
+    await clearExpiredQueueIfNeeded();
+  } catch (error) {
+    console.error('Queue expire check failed:', error);
+  }
+}, 60 * 1000);
 
 (async () => {
   try {
